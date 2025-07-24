@@ -20,16 +20,16 @@ def multi_stage_optimize(params,body_models,kp3ds):
     # Use pre-computed shape, otherwise `optimize_shape` can be used
 
     # optimize RT
-    params=optimize_pose(params,body_models,kp3ds,
+    params=optimize_pose_adam(params,body_models,kp3ds,
                          OPT_RT=True)
 
     # optimize body poses
-    params=optimize_pose(params,body_models,kp3ds,
+    params=optimize_pose_adam(params,body_models,kp3ds,
                          OPT_RT=True,OPT_POSE=True)
     
     # optimize hand poses
-    params=optimize_pose(params,body_models,kp3ds,
-                        OPT_RT=False,OPT_POSE=True,OPT_HAND=True)
+    # params=optimize_pose(params,body_models,kp3ds,
+    #                     OPT_RT=False,OPT_POSE=True,OPT_HAND=True)
     
     return params
 
@@ -43,6 +43,81 @@ def optimize_pose(params,body_models,kp3ds,
         
         loss_dict+=[
             'k3d','reg_pose' ,'smooth_pose','smooth_body'
+        ]
+        opt_params+=[params['global_orient'],params['transl']]
+        loss_weight=OPTIMIZE_RT
+        desc='Optimizing RT...'
+    if OPT_POSE:
+        opt_params+=[params['body_pose']]
+        loss_weight=OPTIMIZE_POSES
+        desc='Optimizing Body pose...'
+    if OPT_HAND:
+        loss_dict+=[
+            'k3d_hand','reg_hand','smooth_hand','k3d','reg_pose' ,'smooth_pose','smooth_body'
+        ]
+        opt_params+=[params['lhand_pose'],params['rhand_pose']] # add wrist to optimize
+        loss_weight=OPTIMIZE_HAND
+        desc='Optimizing Hand...'
+    if OPT_EXPR:
+        loss_dict+=[
+            'k3d_face','reg_head','reg_expr','smooth_head'
+        ]
+        opt_params+=[params['jaw_pose'],params['leye_pose'],
+                     params['reye_pose'],params['expression']]
+        loss_weight=OPTIMIZE_EXPR
+        desc='Optimizing Expression...'
+
+    optimizer=LBFGS(opt_params,line_search_fn='strong_wolfe',max_iter=30)
+    def closure(debug=False):
+        optimizer.zero_grad()
+        axis_angle=torch.cat([params['global_orient'][:,None,:],
+                            params['body_pose'],
+                            params['leye_pose'][:,None,:],
+                            params['reye_pose'][:,None,:],
+                            params['jaw_pose'][:,None,:],
+                            params['lhand_pose'],
+                            params['rhand_pose']
+                            ],axis=1).reshape((-1,3)) # nf*55,3
+        rot_mat=aa2rot_torch(axis_angle).reshape((nf,-1,3,3)) # nf,55,3,3
+        out_kp3d=body_models(
+            betas=params['betas'],
+            expression=params['expression'],
+            global_orient=rot_mat[:,0,...],
+            body_pose=rot_mat[:,1:22,...],
+            leye_pose=rot_mat[:,22,...],
+            reye_pose=rot_mat[:,23,...],
+            jaw_pose=rot_mat[:,24,...],
+            left_hand_pose=rot_mat[:,25:40,...],
+            right_hand_pose=rot_mat[:,40:55,...],
+            transl=params['transl']
+        ).joints # nf,nj(JOINT_MAPPER),3
+        final_loss_dict={loss_name:get_loss(loss_name,kp3ds,out_kp3d,params) 
+                         for loss_name in loss_dict}
+        loss=sum([final_loss_dict[key]*loss_weight[key]
+                  for key in loss_dict])
+        if not debug:
+            loss.backward()
+            return loss
+        else:
+            return final_loss_dict
+    
+    final_loss=run_fitting(optimizer,closure,opt_params,desc)
+    final_loss_dict=closure(debug=True)
+    for key in final_loss_dict.keys():
+        print("%s : %f"%(key,final_loss_dict[key].item()))
+
+    return params
+
+def optimize_pose_adam(params,body_models,kp3ds,
+                  OPT_RT=False,OPT_POSE=False,
+                  OPT_HAND=False,OPT_EXPR=False):
+    nf=kp3ds.shape[0]
+    loss_dict=[]
+    opt_params=[]
+    if OPT_RT:
+        
+        loss_dict+=[
+            'k3d'
         ]
         opt_params+=[params['global_orient'],params['transl']]
         loss_weight=OPTIMIZE_RT
